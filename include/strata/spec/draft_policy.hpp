@@ -45,6 +45,10 @@ public:
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    /// STRATA_SPEC_FIXED_COST=1 (A/B and quality runs): observe() prices every round from the fixed shape table instead
+    /// of its measured time, so the window sizes - and with them the tokens - repeat run to run and between builds of
+    /// different speed.  Not for speed: the windows no longer follow this PC's real costs.
+    static bool fixed_cost();
 
 private:
     static int bucket(int match);

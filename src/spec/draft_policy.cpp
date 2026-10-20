@@ -2,6 +2,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -50,6 +51,11 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
+bool DraftPolicy::fixed_cost() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SPEC_FIXED_COST"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+
 bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
 
 double DraftPolicy::mtp_tokens(int t) const {
@@ -91,6 +97,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
+        if (fixed_cost()) round_ms = kShape[t];   // the shape's units: only ratios are compared
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;
@@ -142,6 +149,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
+        if (fixed_cost()) round_ms = kShape[t];   // the shape's units: only ratios are compared
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
         last_[t] = rounds_;
