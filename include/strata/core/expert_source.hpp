@@ -26,6 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <array>
@@ -178,6 +179,9 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
 class ExpertSource {
 public:
     virtual ~ExpertSource() = default;
+
+    /// The expert table this source's blobs follow: the process-wide one, or (hybrid experts) the GPU cache's own.
+    virtual const strata::kernels::cpu::ExpertLayout& layout() const { return strata::kernels::cpu::expert_layout(); }
 
     /// The expert-layout blob for `(layer, expert)`, or nullptr if it cannot be produced.
     ///
@@ -719,6 +723,12 @@ public:
     /// STRATA_NUMA_SPLIT: files the engine read at start outside this source (the pack's dense.bin, the MTP head),
     /// whose cached pages the placement's drop gives back too.  Set BEFORE `pin_cache_complement`.
     void set_extra_drop_files(std::vector<std::string> paths) { extra_drop_files_ = std::move(paths); }
+    /// Hybrid experts: this source serves the GPU expert cache's format (`gpu_expert_layout()`), not the RAM copy's.
+    /// Set before `open`.
+    void set_layout(const strata::kernels::cpu::ExpertLayout* lay) { lay_ = lay; }
+    const strata::kernels::cpu::ExpertLayout& layout() const override {
+        return lay_ != nullptr ? *lay_ : strata::kernels::cpu::expert_layout();
+    }
     /// Whether the experts are read from the GGUF shards in place (no experts.bin).
     bool gguf_mode() const { return !role_ptr_.empty(); }
     /// Pin a compact host mirror of experts absent from a fully filled static GPU cache. The mmap remains open
@@ -891,6 +901,13 @@ public:
     /// Mapped reads: asks the OS for these pairs' blobs ahead (platform::advise_willneed).  False when unbuffered,
     /// when read-ahead is off, or before `open`.
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override;
+    /// Hybrid experts' promotions: whether every page of the blob is in the page cache (mincore; always true off Linux),
+    /// i.e. whether copying it now reads no disk.
+    bool blob_cached(int64_t layer, int64_t expert) const;
+    /// Hybrid experts' promotion ring (--promote-ring-pct): the blob's bytes from the files into `dst` with pread - one
+    /// read per role slice through its mapping's own descriptor, so no page faults and no read-ahead beyond the blob -
+    /// or, where that fails, a copy out of the mapping.  Safe to call from several threads at once.
+    bool read_blob(int64_t layer, int64_t expert, uint8_t* dst) const;
 
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// With io prefetch in the experts.bin tier, the mapping itself (blob() may hand out a recycled staging buffer).
@@ -1064,6 +1081,7 @@ private:
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
     // ---- CS-T: the GGUF shards in place
+    const strata::kernels::cpu::ExpertLayout* lay_ = nullptr;   // null: the process-wide table
     std::string gguf_;
     std::vector<std::string> extra_drop_files_;   ///< set_extra_drop_files
     struct Map {

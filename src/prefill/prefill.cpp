@@ -72,6 +72,7 @@ namespace strata::prefill::mmq {
 bool built() { return false; }
 bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
+int q8_layout(int) { return -1; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*, float*) {}
@@ -877,6 +878,12 @@ struct Prefill::Impl {
     core::ExpertSource* src = nullptr;
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
+    // hybrid split: the caller's residency table (live: lent slots are -1), and each chunk's own view of it - the GPU
+    // cache's slots on the split layers in the staged walk, -1 everywhere else (host_res points at it then)
+    const int32_t* host_res_live = nullptr;
+    std::vector<int32_t> res_eff;
+    // step B: per pair, the RAM tier's device-readable blob of a split layer's expert not in VRAM (empty: none)
+    std::vector<const uint8_t*> a_eff;
     int64_t T = 0, T_max = 0;
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
@@ -1158,6 +1165,9 @@ struct MmqPlan {
     // STRATA_MMQ_GROUP_SORT=1 (without STRATA_MMQ_RESIDENT_SORT_NE): per MMQ layer, whether both products' 16-expert
     // launches run whole tiles on every visible GPU (mmq::whole_tiles), so its full groups may be taken in row-count order
     std::vector<char> group_sort;
+    // STRATA_HYBRID_PF_SPLIT=1 (hybrid experts): per MMQ layer, whether its experts in VRAM run in the GPU cache's format
+    std::vector<char> split;
+    bool split_any = false;
 };
 // Volta (sm_70): MMQ runs on dp4a there (no int8 tensor cores).  pf_wmma(): the layers MMQ would take, and the IQ1_M
 // ones the FP16 path would, run as one launch per expert group on FP16 tensor-core tiles instead
@@ -1238,6 +1248,37 @@ const MmqPlan& mmq_plan() {
             }
             std::fprintf(stderr, "strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): %lld of %lld "
                                  "layers\n", (long long) nd, (long long) layers);
+        }
+        // STRATA_HYBRID_PF_SPLIT=1, hybrid experts: a layer's experts in VRAM can run in the GPU cache's own format
+        // (gpu_expert_layout(); the rest in the RAM copy's) where MMQ takes both its types, its activations' q8_1 layout
+        // is the RAM copy's (one quantization of the layer's rows serves both sets), and neither format keeps scales
+        // after its blocks.  The group buffers then hold the larger of the two formats.
+        p.split.assign(p.layer.size(), 0);
+        if (const char* se = std::getenv("STRATA_HYBRID_PF_SPLIT"); on && se && se[0] == '1') {
+            const auto& glay = strata::kernels::cpu::gpu_expert_layout();
+            if (&glay == &lay || !lay.native || !glay.native || glay.fmt.size() != lay.fmt.size()) {
+                std::fprintf(stderr, "strata: STRATA_HYBRID_PF_SPLIT=1 is for hybrid experts (two native expert formats): "
+                                     "off\n");
+            } else {
+                int64_t ns = 0;
+                for (int64_t l = 0; l < layers; ++l) {
+                    if (!p.layer[(size_t) l]) continue;
+                    const auto &fa = glay.fmt[(size_t) l], &fb = lay.fmt[(size_t) l];
+                    if (!mmq::fits(fa.gu_type, 1280) || !mmq::fits(fa.d_type, N)) continue;
+                    const int qa = mmq::q8_layout(fa.gu_type);
+                    if (qa < 0 || qa != mmq::q8_layout(fb.gu_type)) continue;
+                    if (fa.tail_off || fb.tail_off || mmq::fp4_activations(fa.gu_type) || mmq::fp4_activations(fb.gu_type))
+                        continue;
+                    p.split[(size_t) l] = 1;
+                    p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(fa.gu_type, 1280, N));
+                    p.d_max = std::max(p.d_max, mmq::matrix_bytes(fa.d_type, N, 640));
+                    ++ns;
+                }
+                p.split_any = ns > 0;
+                std::fprintf(stderr, "strata: hybrid experts: the prompt computes the experts in VRAM in the GPU cache's "
+                                     "format (STRATA_HYBRID_PF_SPLIT=1) on %lld of %lld layers\n", (long long) ns,
+                                     (long long) layers);
+            }
         }
         // the verdict depends only on the layer's formats and the visible GPUs: taken once here, not per chunk
         p.group_sort.assign(p.layer.size(), 0);
@@ -1384,6 +1425,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     return strata::metal_engine::window_ensure(g, ss, ss.qsa_states[ss.qsa_primary()].max_cells, err);
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+    m.host_res_live = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
@@ -2431,6 +2473,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 }
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
+bool Prefill::hybrid_split() { return mmq_plan().split_any; }
 size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
 
 namespace {
@@ -2910,6 +2953,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // hybrid split: only the split layers' experts in VRAM count as resident (every other layer takes the RAM copy's
+        // format for all, as without the split); step B/C: and the experts the RAM tier holds, in both walks
+        if (mmq_plan().split_any && m.host_res_live != nullptr) {
+            const size_t ne = (size_t) m.g->n_expert;
+            m.res_eff.assign((size_t) m.g->n_layers * ne, -1);
+            m.a_eff.clear();
+            {
+                if (a_blob) m.a_eff.assign((size_t) m.g->n_layers * ne, nullptr);
+                for (int64_t l = 0; l < m.g->n_layers && (size_t) l < mmq_plan().split.size(); ++l) {
+                    if (!mmq_plan().split[(size_t) l]) continue;
+                    std::copy(m.host_res_live + (size_t) l * ne, m.host_res_live + (size_t) (l + 1) * ne,
+                              m.res_eff.begin() + (ptrdiff_t) ((size_t) l * ne));
+                    if (a_blob)   // step B: the tier's copies of the experts not in VRAM
+                        for (size_t e = 0; e < ne; ++e)
+                            if (m.res_eff[(size_t) l * ne + e] < 0) m.a_eff[(size_t) l * ne + e] = a_blob((int64_t) (l * ne + e));
+                }
+            }
+            m.host_res = m.res_eff.data();
+        }
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
         struct PoolHold {
@@ -2964,6 +3026,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                    // hybrid split, step C: the RAM tier's experts are read by the gather, in the GPU cache's format
+                    if (!m.a_eff.empty() && (size_t) l < mmq_plan().split.size() && mmq_plan().split[(size_t) l] &&
+                        m.a_eff[(size_t) l * m.g->n_expert + e] != nullptr) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
@@ -3630,6 +3695,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    // hybrid split: this layer's experts in VRAM run in the GPU cache's format, first, the others after
+                    const bool split_l = mmq_plan().split_any && (size_t) l < mmq_plan().split.size() &&
+                                         mmq_plan().split[(size_t) l] && use_mmq && !fused_l && !m.pp &&
+                                         m.host_res != nullptr && m.cache != nullptr;
+                    // step B: an expert the RAM tier holds in the GPU cache's format (read over PCIe), or null
+                    auto a_ptr = [&](int32_t e) -> const uint8_t* {
+                        return split_l && !m.a_eff.empty() ? m.a_eff[(size_t) l * m.g->n_expert + e] : nullptr;
+                    };
+                    // the split's A set: in VRAM, or in the RAM tier - both computed in the GPU cache's format
+                    auto in_vram = [&](int32_t e) {
+                        return split_l && (m.host_res[(size_t) l * m.g->n_expert + e] >= 0 || a_ptr(e) != nullptr);
+                    };
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3852,7 +3929,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             int64_t nstream = 0;
                             for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                 const int32_t c = m.cnt[(size_t) e];
-                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0))
+                                if (c == 0 || (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                                    a_ptr(e) != nullptr)   // (step B: the GPU reads the tier's copy)
                                     continue;
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
@@ -3905,8 +3983,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         {
                             int32_t r = 0;
+                            // hybrid split: pass 0 the experts in VRAM, pass 1 the others (without the split: one pass, all)
+                            for (int pass = split_l ? 0 : 1; pass < 2; ++pass)
                             for (int32_t e = 0; e < m.g->n_expert; ++e)
-                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e])) {
+                                if ((on_peer.empty() || !on_peer[(size_t) e]) && (on_cpu.empty() || !on_cpu[(size_t) e]) &&
+                                    (pass == 0) == in_vram(e)) {
                                     m.off[(size_t) e] = r;
                                     r += m.cnt[(size_t) e];
                                 }
@@ -3928,10 +4009,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
+                        size_t nA = 0;   // hybrid split: order's first nA experts are in VRAM (the GPU cache's format)
+                        for (int pass = split_l ? 0 : 1; pass < 2; ++pass)
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
                             if (m.cnt[(size_t) e] > 0 && (on_peer.empty() || on_peer[(size_t) e] != 2) &&
-                                (on_cpu.empty() || !on_cpu[(size_t) e]))
+                                (on_cpu.empty() || !on_cpu[(size_t) e]) && (pass == 0) == in_vram(e)) {
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
+                                if (pass == 0) ++nA;
+                            }
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
                         // Aurora (STRATA_MMQ_RESIDENT_SORT_NE=1, opt-in): a layer whose experts are ALL resident and
@@ -3944,7 +4029,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool sort_all = detail::mmq_resident_sort_requested();
                         const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
-                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty(), use_mmq, lay.native,
+                        if (detail::mmq_resident_sort_eligible((sort_all || sort_full) && on_peer.empty() && !split_l, use_mmq, lay.native,
                                 m.cache != nullptr, m.host_res ? m.host_res + (size_t) l * m.g->n_expert : nullptr,
                                 m.g->n_expert, stream_all, !stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]))
                             detail::mmq_resident_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h,
@@ -4060,6 +4145,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        // the formats a group computes in: the RAM copy's (B), or for the split's experts in VRAM the GPU
+                        // cache's (A).  A group never holds both: the groups run [0, nA) and [nA, n) in 16s (nA = 0: the
+                        // plain grid of 16s)
+                        struct SetFmt { int gt, dt; size_t gub, db; const strata::kernels::cpu::NativeFmt* f; };
+                        const SetFmt set_b{mmq_gt, mmq_dt, mmq_gub, mmq_db, lay.native ? &lay.fmt[(size_t) l] : nullptr};
+                        SetFmt set_a = set_b;
+                        if (split_l) {
+                            const auto& fa = strata::kernels::cpu::gpu_expert_layout().fmt[(size_t) l];
+                            set_a = SetFmt{fa.gu_type, fa.d_type, mmq::matrix_bytes(fa.gu_type, 1280, N),
+                                           mmq::matrix_bytes(fa.d_type, N, 640), &fa};
+                        }
+                        const SetFmt* gg_set = &set_b;   // the open group's (flush)
+                        auto group_of = [&](size_t j, size_t& j0, size_t& end, size_t& g) {
+                            if (j < nA) { g = j / MMQ_GROUP; j0 = g * MMQ_GROUP; end = std::min(j0 + MMQ_GROUP, nA); return; }
+                            const size_t ga = (nA + MMQ_GROUP - 1) / MMQ_GROUP, b = (j - nA) / MMQ_GROUP;
+                            g = ga + b;
+                            j0 = nA + b * MMQ_GROUP;
+                            end = std::min(j0 + MMQ_GROUP, order.size());
+                        };
                         pt.mark(kPfGather, cs);
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
@@ -4084,14 +4188,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
-                            const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
+                            const size_t n = order.size();
+                            const size_t ng = (nA + MMQ_GROUP - 1) / MMQ_GROUP + (n - nA + MMQ_GROUP - 1) / MMQ_GROUP;
+                            if (n + 1 + ng * (MMQ_GROUP + 1) > (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2))) {
+                                err = "prefill: the group bounds do not fit their buffer";
+                                return false;
+                            }
                             m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
                             for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
                             m.bounds_host[n] = (int32_t) rows_local;
-                            for (size_t g = 0; g < ng; ++g)
+                            for (size_t j = 0; j < n;) {
+                                size_t j0 = 0, end = 0, g = 0;
+                                group_of(j, j0, end, g);
                                 for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                     m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                        m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                                        m.bounds_host[std::min(end, j0 + i)] - m.bounds_host[j0];
+                                j = end;
+                            }
                             if (grp_mapped) {
                                 int32_t* bh = m.grp_host + 3 * m.grp_tk;
                                 std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
@@ -4428,6 +4541,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                if (a_ptr(e) != nullptr) continue;   // step B: read from the tier by the gather
                                 if (m.src->pinned(l, e)) continue;
                                 job_of[j] = (int) js.size();
                                 if (m.src->transient(l, e)) {   // CS-T: copied by the source
@@ -4444,7 +4558,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident) return true;
+                            if (resident || a_ptr(e) != nullptr) return true;   // (step B: no staging slot)
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -4491,7 +4605,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // group's tail is zeroed by prep_group
                         auto flush = [&](size_t zero) {
                             if (gg.n <= gg.first) return;
-                            const auto& f = lay.fmt[(size_t) l];
+                            const auto& f = gg_set->f ? *gg_set->f : lay.fmt[(size_t) l];
+                            const size_t mmq_gub = gg_set->gub, mmq_db = gg_set->db;   // (the open group's)
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 pt.mark(kPfWaitCopy, cs);
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
@@ -4525,9 +4640,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
-                                const size_t q = j % MMQ_GROUP;
+                                size_t j0 = 0, gend = 0, g = 0;
+                                group_of(j, j0, gend, g);
+                                const size_t q = j - j0;
                                 // the group's last expert also zeroes the MMQ tail after its slot (see MMQ_TAIL)
-                                const bool last_of_group = q + 1 == MMQ_GROUP || j + 1 == order.size();
+                                const bool last_of_group = j + 1 == gend;
+                                // the group's formats (the split's experts in VRAM: the GPU cache's)
+                                const SetFmt& sf = j < nA ? set_a : set_b;
+                                const size_t mmq_gub = sf.gub, mmq_db = sf.db;
+                                const int mmq_gt = sf.gt, mmq_dt = sf.dt;
+                                gg_set = &sf;
                                 if (direct) {
                                     const auto& f = lay.fmt[(size_t) l];
                                     uint8_t* gp = cslot >= 0 && ((uintptr_t) blob_dev | (uintptr_t) f.down_off) % 16 == 0
@@ -4553,7 +4675,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         }
                                     }
                                     if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
-                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                    if (!last_of_group) return true;
                                     if (gg_now) {   // also when the last entry was direct (a no-op without gathers)
                                         flush(0);
                                         gg = mmq::GatherGroup{};
@@ -4567,7 +4689,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     flush(MMQ_TAIL);
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
-                                    const auto& f = lay.fmt[(size_t) l];
+                                    const auto& f = *sf.f;
                                     // NVFP4: this expert's scales go next to its group slot in the same launch
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                        mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs,
@@ -4581,10 +4703,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                 }
                                 if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
-                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                if (!last_of_group) return true;
                                 }
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
-                                const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                const size_t n = order.size();
                                 const int ngx = (int) (q + 1);
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                                 int64_t maxr = 0;
@@ -4619,7 +4741,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
                                 m.mmq_ctx->run(gu, m.cs);
-                                if (lay.native && lay.fmt[(size_t) l].tail_off)   // gate/up scales applied as read
+                                if (lay.native && sf.f->tail_off)   // gate/up scales applied as read
                                     mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + j0, ngx,
                                                        m.grp_tail, r0, m.cs);
                                 else
@@ -4636,7 +4758,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.y_scale = mmq::fp4_activations(mmq_dt) ? m.Hscale : nullptr;
                                 if (direct) dn.tab = &td;
                                 m.mmq_ctx->run(dn, m.cs);
-                                if (lay.native && lay.fmt[(size_t) l].tail_off)   // s_down: applied by the combine
+                                if (lay.native && sf.f->tail_off)   // s_down: applied by the combine
                                     mmq::down_row_scales(m.row_sd + r0, dn.bounds, ngx, m.grp_tail, nr, m.cs);
                                 if (direct) {
                                     tgu = mmq::WeightTab{};
@@ -4690,7 +4812,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++staged;
                                 }
                                 const int32_t e = order[j];
-                                if (stage_of[j] < 0) {
+                                if (stage_of[j] < 0 && m.host_res[(size_t) l * m.g->n_expert + e] < 0) {
+                                    // step B: the RAM tier's copy, read over PCIe by the group's gather
+                                    const uint8_t* ab = a_ptr(e);
+                                    if (ab == nullptr) { err = "prefill: an expert is neither resident, staged nor in the tier"; return false; }
+                                    ++stats_.experts_tier;
+                                    if (!compute(j, ab, -1, -1)) return false;
+                                } else if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
                                                  m.host_res[(size_t) l * m.g->n_expert + e])) return false;
@@ -4720,6 +4848,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             };
                             for (size_t j = 0; j < order.size(); ++j) {
                                 const int32_t e = order[j];
+                                if (j < nA) {   // hybrid split: in VRAM or in the RAM tier, not in the ring (which stays as it is)
+                                    const int32_t cs_ = m.host_res[(size_t) l * m.g->n_expert + e];
+                                    const uint8_t* bp = cs_ >= 0 ? m.cache->device_slot(cs_) : a_ptr(e);
+                                    if (bp == nullptr) { err = "prefill: a split expert is neither resident nor in the tier"; return false; }
+                                    ++(cs_ >= 0 ? stats_.experts_resident : stats_.experts_tier);
+                                    if (!compute(j, bp, -1, cs_ >= 0 ? cs_ : -1)) return false;
+                                    continue;
+                                }
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);

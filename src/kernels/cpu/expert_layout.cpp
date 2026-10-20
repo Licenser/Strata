@@ -19,9 +19,13 @@
 namespace strata::kernels::cpu {
 namespace {
 ExpertLayout g_layout;
+ExpertLayout g_gpu_layout;   // hybrid experts: the GPU expert cache's format (unused unless g_gpu_set)
+bool g_gpu_set = false;
 }
 
 const ExpertLayout& expert_layout() { return g_layout; }
+const ExpertLayout& gpu_expert_layout() { return g_gpu_set ? g_gpu_layout : g_layout; }
+bool expert_layout_hybrid() { return g_gpu_set; }
 
 int cpu_isa_cap() {
     // STRATA_FORCE_ISA (tests, the experimental older-CPU builds): the engine's own dispatch acts as if this CPU
@@ -385,7 +389,8 @@ void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, f
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+static bool load_into(ExpertLayout& out, const std::string& pack_dir, int64_t n_layers, int64_t n_expert,
+                      std::string& err) {
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -393,7 +398,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     if (!in) {
         L.total = (uint64_t) n_layers * (uint64_t) n_expert * (uint64_t) BLOB;
         hadamard_set({});
-        g_layout = L;
+        out = L;
         return true;
     }
 #if !defined(STRATA_NATIVE_EXPERTS)
@@ -532,9 +537,28 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             }
         }
     }
-    g_layout = L;
+    out = L;
     return true;
 #endif
+}
+
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    ExpertLayout L;
+    if (!load_into(L, pack_dir, n_layers, n_expert, err)) return false;
+    g_layout = L;
+    return true;
+}
+
+bool expert_layout_load_gpu(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+    ExpertLayout L;
+    if (!load_into(L, pack_dir, n_layers, n_expert, err)) return false;
+    if (!L.native) {
+        err = "the GPU expert cache's pack (" + pack_dir + ") has no native_experts.txt";
+        return false;
+    }
+    g_gpu_layout = L;
+    g_gpu_set = true;
+    return true;
 }
 
 }  // namespace strata::kernels::cpu

@@ -20,6 +20,10 @@ bool supported(int ggml_type);
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
 /// ("J_best=0") when nothing fits.  false (said once per type) keeps that product on the non-MMQ path.
 bool fits(int ggml_type, int64_t w_rows);
+/// The q8_1 block layout MMQ quantizes the activations to for weights of `ggml_type` (llama.cpp's
+/// mmq_get_q8_1_ds_layout), or -1 when MMQ does not take the type.  Two types with the same layout can share one
+/// quantization of the same rows (the hybrid prompt split).
+int q8_layout(int ggml_type);
 /// NVFP4 prompt precision, STRATA_PREFILL_NVFP4: w4a8 (default) - int8 tensor cores, Q8_1 activations, what decode
 /// runs at; w4a4 - Blackwell's FP4 x FP4 MMA, activations rounded to NVFP4 (faster, first-token KL up to 0.03 vs
 /// fp16); fp16 - the dequantize + FP16 GEMM path (the reference).
