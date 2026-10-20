@@ -2973,6 +2973,9 @@ int main(int argc, char** argv) {
     }
     const bool remote_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
                                o.expert_cache_remote[2] > 0;
+    if (strata::spec::DraftPolicy::fixed_cost())
+        std::fprintf(stderr, "strata generate: STRATA_SPEC_FIXED_COST=1: the draft policy prices windows from a fixed table, "
+                             "not measured times (repeatable runs; not for speed)\n");
     // A layer split keeps the resident RAM mode: every stage's GPU cache is left out of the RAM copy, and an adaptive
     // swap copies an evicted expert back from the card that owns its layer (resident_stage_swaps).
     // The helper-GPU caches are allowed beside the resident RAM mode too: their experts are left out of the RAM copy
