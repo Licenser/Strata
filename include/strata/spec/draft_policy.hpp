@@ -105,6 +105,10 @@ public:
     /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);
     double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
+    /// STRATA_SPEC_FIXED_COST=1 (A/B and quality runs): observe() prices every round from the fixed shape table instead
+    /// of its measured time, so the window sizes - and with them the tokens - repeat run to run and between builds of
+    /// different speed.  Not for speed: the windows no longer follow this PC's real costs.
+    static bool fixed_cost();
 
 private:
     static int bucket(int match);

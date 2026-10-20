@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -127,6 +128,11 @@ std::string DraftPolicy::cost_table_text() const {
     return out;
 }
 
+bool DraftPolicy::fixed_cost() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_SPEC_FIXED_COST"); return e != nullptr && std::atoi(e) != 0; }();
+    return v;
+}
+
 bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
 
 double DraftPolicy::mtp_tokens(int t) const {
@@ -170,6 +176,7 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
+        if (fixed_cost()) round_ms = kShape[t];   // the shape's units: only ratios are compared
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
         cost_n_[bk_][t] += 1.0;
@@ -312,6 +319,7 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
         round_ms = clamp_sample(t, round_ms);
+        if (fixed_cost()) round_ms = kShape[t];   // the shape's units: only ratios are compared
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
         cost_n_[bk_][t] += 1.0;
