@@ -94,6 +94,13 @@ const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
 /// Versions up to kExpertLayoutVersion are read; a newer one is refused (a newer packer wrote it).
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// Hybrid experts (--cpu-experts-gguf): the format of the experts the GPU's expert cache holds, when it differs from
+/// the RAM copy's (`expert_layout()`, which the arena, the CPU pool and the prompt path use).  Without
+/// `expert_layout_load_gpu` this is the same object as `expert_layout()`, so every caller sees today's table.
+const ExpertLayout& gpu_expert_layout();
+/// Reads a second native_experts.txt for the GPU's expert cache (the hybrid mode); `expert_layout_hybrid()` is then true.
+bool expert_layout_load_gpu(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+bool expert_layout_hybrid();
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 inline constexpr int kExpertLayoutVersion = 4;

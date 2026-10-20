@@ -35,6 +35,7 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    int64_t experts_tier = 0;       ///< hybrid split: ...read by the GPU from the RAM tier, in the GPU cache's format
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
@@ -162,6 +163,16 @@ public:
     /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
     /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
     static size_t slot_guard_bytes();
+
+    /// STRATA_HYBRID_PF_SPLIT=1 with hybrid experts (two expert formats): whether the prompt computes the experts in VRAM
+    /// in the GPU cache's own format, on the layers where MMQ allows it.  Then `init` must be handed the real residency
+    /// table: the prompt path masks every layer and chunk the split does not cover itself.  False otherwise (the hybrid
+    /// hands a table with no expert resident, and every prompt expert takes the RAM copy's format).
+    static bool hybrid_split();
+    /// Hybrid split, step B: a device-readable pointer to (layer * n_expert + expert)'s blob in the GPU cache's format
+    /// held in page-locked host RAM (the RAM tier), or null.  Read once per chunk; the prompt path then computes such an
+    /// expert in that format too, reading its bytes over PCIe in the gather (no staging slot).  Unset: VRAM only.
+    std::function<const uint8_t*(int64_t pair)> a_blob;
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.

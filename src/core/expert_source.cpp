@@ -828,7 +828,7 @@ const uint8_t* FileExpertSource::io_blob(int64_t layer, int64_t expert) {
 bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
     close();
     if (n_layers <= 0 || n_expert <= 0) { err = "FileExpertSource: the geometry is empty"; return false; }
-    const auto& layout = strata::kernels::cpu::expert_layout();
+    const auto& layout = this->layout();   // hybrid experts: the GPU cache's table when set_layout gave one
     if (layout.n_layers != n_layers || layout.n_expert != n_expert) {
         err = "FileExpertSource: the requested geometry does not match the loaded expert layout";
         return false;
@@ -1112,7 +1112,7 @@ void FileExpertSource::close() {
 bool ExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     const uint8_t* b = blob(layer, expert);
     if (b == nullptr || dst == nullptr) return false;
-    std::memcpy(dst, b, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer));
+    std::memcpy(dst, b, (size_t) layout().blob_bytes(layer));
     return true;
 }
 
@@ -1130,7 +1130,7 @@ bool ExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts, uin
 // blob is assembled when it is asked for (`blob`, into a small pool of buffers) or copied where it is needed
 // (`copy_blob`: the RAM copy, the prompt path's pinned stager buffers).
 bool FileExpertSource::open_gguf(std::string& err) {
-    const auto& lay = strata::kernels::cpu::expert_layout();
+    const auto& lay = layout();
     if (!check_experts_gguf(gguf_, lay, err)) { err = "FileExpertSource: " + err; return false; }
     const size_t cut = gguf_.find_last_of("/\\");
     const std::string dir = cut == std::string::npos ? std::string() : gguf_.substr(0, cut + 1);
@@ -1539,6 +1539,44 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
         }
     }
     return true;
+}
+
+bool FileExpertSource::blob_cached(int64_t layer, int64_t expert) const {
+#if defined(__linux__)
+    uint64_t total = 0;
+    const uint64_t have = cached_bytes(layer, expert, total, /*exact=*/true);
+    return total > 0 && have >= total;
+#else
+    (void) layer; (void) expert;
+    return true;
+#endif
+}
+
+bool FileExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst) const {
+#if defined(__linux__)
+    Span sp[3];
+    const int ns = dst != nullptr ? spans(layer, expert, sp) : 0;
+    if (ns <= 0) return false;
+    for (int i = 0; i < ns; ++i) {
+        int fd = -1;
+        uint64_t off = 0;
+        if (!role_ptr_.empty()) {
+            for (const Map& m : maps_)
+                if (!m.closed && sp[i].p >= m.base && sp[i].p < m.base + m.bytes) {
+                    fd = m.fd;
+                    off = (uint64_t) (sp[i].p - m.base);
+                    break;
+                }
+        } else if (fd_ >= 0) {
+            fd = fd_;
+            off = (uint64_t) (sp[i].p - base_);
+        }
+        if (fd < 0 || !pread_full(fd, dst + sp[i].at, sp[i].n, off)) std::memcpy(dst + sp[i].at, sp[i].p, (size_t) sp[i].n);
+    }
+    return true;
+#else
+    return copy_from_files(layer, expert, dst);
+#endif
 }
 
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {

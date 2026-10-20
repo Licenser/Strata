@@ -81,7 +81,7 @@ def mem_available_gb() -> float:
     return float("inf")
 
 
-def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
+def engine_args(cfg: dict, gpu_experts, seg_tokens: int, adapt_every=None) -> list[str]:
     base, out, i = list(cfg["args"]), [], 0
     while i < len(base):
         x = base[i]
@@ -96,6 +96,8 @@ def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
     fixed = list(FIXED)
     if gpu_experts:
         fixed[1] = gpu_experts if isinstance(gpu_experts, str) else "1500"
+    if adapt_every:                        # --adapt-every: the expert tier adapts (the hybrid's real placement)
+        fixed[3] = str(adapt_every)
     return [cfg["exe"], "--serve", *out, *fixed, "--max-context", str(seg_tokens + 512),
             "--short-read", str(seg_tokens + 64), "--prefill", "512"]
 
@@ -117,9 +119,11 @@ def cmd_run(a) -> int:
         env[k] = v
     env["STRATA_LOGPOS"] = str(out)
     env["STRATA_LOGPOS_TOPK"] = str(TOPK)
+    if a.adapt_every:
+        env["STRATA_READ_ADAPT"] = "1"     # the tier runs between the reading windows too (else it never runs here)
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
-    args = engine_args(cfg, a.gpu_experts, st["seg_tokens"])
+    args = engine_args(cfg, a.gpu_experts, st["seg_tokens"], a.adapt_every)
     if a.wrap:
         args = a.wrap.split() + args
     errf = open(str(out) + ".stderr.txt", "w")
@@ -353,6 +357,10 @@ def main() -> int:
     p.add_argument("--env", action="append")
     p.add_argument("--gpu-experts", nargs="?", const=True, default=False,
                    help="--expert-cache 1500 (or the N given, e.g. auto) instead of one slot (the experts on the GPU kernels)")
+    p.add_argument("--adapt-every", type=int,
+                   help="let the expert tier adapt every N windows (with --gpu-experts) instead of a fixed placement, "
+                        "the reading windows included (STRATA_READ_ADAPT=1: the copies land before the next window); "
+                        "the hybrid mode's 3-bit share depends on it")
     p.add_argument("--min-free-gb", type=float, default=16)
     p.add_argument("--wrap", help="a command prefix for the engine, e.g. 'systemd-run --user --scope -p MemoryMax=200G'")
     p = sub.add_parser("prompt", help="the batched prompt path's next-token logits after 20 prompts (a directory)")

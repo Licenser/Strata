@@ -278,6 +278,8 @@ bool supported(int t) {
     }
 }
 
+int q8_layout(int t) { return supported(t) ? (int) mmq_get_q8_1_ds_layout((ggml_type) t) : -1; }
+
 bool fits(int t, int64_t w_rows) {
     if (!supported(t)) return false;
     // mul_mat_q_case's choice: the "fallback" configs when the rows are not a multiple of 128; then
