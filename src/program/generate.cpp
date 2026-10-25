@@ -3940,6 +3940,18 @@ int main(int argc, char** argv) {
                                      "the same geometry as --pack %s\n", o.cpu_experts_layout.c_str(), o.pack.c_str());
                 return 1;
             }
+            // APR packs set one process-wide rotation (hadamard_set); the second table's load replaces the first's
+            auto folded = [](const strata::kernels::cpu::ExpertLayout& lay) {
+                for (const auto& f : lay.fmt)
+                    if (f.had_gu || f.had_d) return true;
+                return false;
+            };
+            if (folded(gl) || folded(cl)) {
+                std::fprintf(stderr, "strata generate: hybrid experts: %s has Hadamard-folded experts (hadamard.txt); "
+                                     "hybrid experts take two packs without hadamard.txt\n",
+                             folded(gl) ? o.pack.c_str() : o.cpu_experts_layout.c_str());
+                return 1;
+            }
             std::fprintf(stderr, "strata generate: hybrid experts: the GPU cache holds %s's format (%.2f GiB for all "
                                  "experts), the RAM copy %s's (%.2f GiB, from %s); promote when ready: %s\n", o.pack.c_str(),
                          (double) gl.total / 1073741824.0, o.cpu_experts_layout.c_str(), (double) cl.total / 1073741824.0,
