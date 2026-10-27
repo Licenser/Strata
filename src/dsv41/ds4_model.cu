@@ -4578,26 +4578,55 @@ struct Model::Impl {
         std::atomic<int64_t> done_b{0};
         // each copied piece's file pages dropped at once: the copy and the cache never hold it twice (DS4_COPY_DROP=0 keeps them)
         const bool drop = env_tri("DS4_COPY_DROP") != 0;
+        // DS4_COPY_GROUP=N: a layer's experts in blocks of N, each role's block read in one piece and handed out from memory
+        const int grp = std::max(1, (int) env_f("DS4_COPY_GROUP", 1.0f));
+        std::vector<std::pair<size_t, size_t>> groups;   // jobs [first, last): one layer, one block of grp expert numbers
+        for (size_t i = 0; i < jobs.size();) {
+            size_t k = i + 1;
+            while (k < jobs.size() && jobs[k].layer == jobs[i].layer && jobs[k].e / grp == jobs[i].e / grp) ++k;
+            groups.push_back({i, k});
+            i = k;
+        }
+        if (grp > 1) std::fprintf(stderr, "ds4: the copy reads blocks of %d experts: %zu reads a role\n", grp, groups.size());
         std::vector<std::thread> th;
         for (int t = 0; t < 12 && !jobs.empty(); ++t)
             th.emplace_back([&] {
-                for (size_t i; (i = ji.fetch_add(1)) < jobs.size() && !bad.load();) {
-                    const Job& j = jobs[i];
-                    const Layer& l = L[(size_t) j.layer];
+                std::vector<uint8_t> buf;
+                for (size_t gi; (gi = ji.fetch_add(1)) < groups.size() && !bad.load();) {
+                    const size_t g0 = groups[gi].first, g1 = groups[gi].second;
+                    const Layer& l = L[(size_t) jobs[g0].layer];
                     for (int r = 0; r < 3; ++r) {
                         const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                        for (int X = 0; X < NH; ++X) {
-                            const uint64_t off = l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb;
-                            if (!pk.read_at(l.mx_file[r], off, nb,
-                                            ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
-                                bad.store(true);
-                            else if (drop)
-                                os::advise(pk.fds[(size_t) l.mx_file[r]], off, nb, false);
+                        if (g1 - g0 == 1) {
+                            const Job& j = jobs[g0];
+                            for (int X = 0; X < NH; ++X) {
+                                const uint64_t off = l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb;
+                                if (!pk.read_at(l.mx_file[r], off, nb,
+                                                ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
+                                    bad.store(true);
+                                else if (drop)
+                                    os::advise(pk.fds[(size_t) l.mx_file[r]], off, nb, false);
+                            }
+                            continue;
                         }
+                        const int e0 = jobs[g0].e;
+                        const uint64_t off = l.mx_off[r] + (uint64_t) e0 * l.mx_stride[r];
+                        const uint64_t span = (uint64_t) (jobs[g1 - 1].e - e0) * l.mx_stride[r] + (uint64_t) NH * nb;
+                        if (buf.size() < span) buf.resize(span);
+                        if (!pk.read_at(l.mx_file[r], off, span, buf.data())) {
+                            bad.store(true);
+                            break;
+                        }
+                        for (size_t q = g0; q < g1; ++q)
+                            for (int X = 0; X < NH; ++X)
+                                std::memcpy(ram_part[(size_t) jobs[q].slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r],
+                                            buf.data() + (uint64_t) (jobs[q].e - e0) * l.mx_stride[r] + (uint64_t) X * nb, nb);
+                        if (drop) os::advise(pk.fds[(size_t) l.mx_file[r]], off, span, false);
                     }
-                    const int64_t db = done_b.fetch_add((int64_t) l.blob) + (int64_t) l.blob;
-                    if (o.verbose && i % 2048 == 0)
-                        std::fprintf(stderr, "ds4: copying experts %zu / %zu (%.1f GB, %.2f GB/s)\n", i, jobs.size(), db / 1e9,
+                    const int64_t gb = (int64_t) l.blob * (int64_t) (g1 - g0);
+                    const int64_t db = done_b.fetch_add(gb) + gb;
+                    if (o.verbose && gi % 256 == 0)
+                        std::fprintf(stderr, "ds4: copying experts %zu / %zu (%.1f GB, %.2f GB/s)\n", g0, jobs.size(), db / 1e9,
                                      db / 1e6 / std::max(1.0, now_ms() - t0));
                 }
             });
