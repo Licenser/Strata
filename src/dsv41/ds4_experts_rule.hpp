@@ -186,6 +186,14 @@ inline bool copy_hugetlb_default(int env, double pool_free_bytes, double copy_by
     return pool_free_bytes > 0.0 && pool_free_bytes >= copy_bytes;
 }
 
+// The copy arena's THP request (MADV_HUGEPAGE): STRATA_NO_ARENA_THP skips it, STRATA_ARENA_THP and 0.2.6 ask; otherwise only when the free
+// 2 MiB blocks (-1: unknown, asked) cover half the arena, as the core engine's arena decides (#2126).
+inline bool arena_thp_default(bool force, bool skip, double free_block_bytes, double arena_bytes, bool v026 = false) {
+    if (skip) return false;
+    if (force || v026 || free_block_bytes < 0.0) return true;
+    return free_block_bytes >= arena_bytes / 2;
+}
+
 // DS4_FAST_ATTN (the chunked prompt's attention on the matrix cores): env -1 unset, else 0 / 1; 0.2.6: opt-in; 0.2.7: on for
 // gfx1200 / gfx1201, and (this change) on for gfx1151 on Windows, where it measured +43.6% on a 32K prompt (101.6 -> 70.8 s,
 // sparse attention 38.3 -> 7.0 s), the same greedy first token and a first-token KL far under the 0.0228 bar.

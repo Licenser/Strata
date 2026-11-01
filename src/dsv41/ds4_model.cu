@@ -193,8 +193,8 @@ std::vector<std::vector<int>> node_cores() {
     }
     return nodes;
 }
-// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages when `thp` asks
+void* node_map(size_t bytes, int node, int n_nodes, bool thp = true) { return os::anon_alloc(bytes, node, n_nodes, thp); }
 void pin_self(int cpu) { os::pin_self(cpu); }
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
@@ -5032,11 +5032,30 @@ struct Model::Impl {
             ++n_copy[(size_t) l.il];
         }
         // each layer's slots: one block per node of (copies + spare) parts
+        const auto slots_of = [&](const Layer& l) { return n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0); };
+        // the THP request, once for the whole arena: every block is mapped before the copy faults any of them (#2126)
+        double arena_b = 0.0;
+        for (const Layer& l : L) arena_b += (double) slots_of(l) * (double) cp_lay[(size_t) l.il][3] * NH;
+        const int64_t thp_free = os::free_thp_block_bytes();
+        const bool skip_thp = std::getenv("STRATA_NO_ARENA_THP") != nullptr;
+        const bool arena_thp = strata::ds4::arena_thp_default(std::getenv("STRATA_ARENA_THP") != nullptr, skip_thp, (double) thp_free,
+                                                              arena_b, defaults_026());
+        if (!huge_arena && arena_b > 0.0) {
+            if (skip_thp)
+                std::fprintf(stderr, "ds4: copy arena: transparent huge pages skipped (STRATA_NO_ARENA_THP)\n");
+            else if (!arena_thp)
+                std::fprintf(stderr, "ds4: copy arena: transparent huge pages NOT requested: %.1f GB of free 2 MiB blocks for a %.1f GB "
+                                     "arena, compaction would stall the copy (STRATA_ARENA_THP=1 requests them anyway) (#2126)\n",
+                             (double) thp_free / 1e9, arena_b / 1e9);
+            else if (o.verbose)
+                std::fprintf(stderr, "ds4: copy arena: transparent huge pages requested (%.1f GB of free 2 MiB blocks for a %.1f GB arena)\n",
+                             (double) thp_free / 1e9, arena_b / 1e9);
+        }
         std::vector<int> first(L.size(), -1);
         copy_spare.assign(L.size(), -1);
         for (Layer& l : L) {
             l.ram.assign((size_t) l.n_exp, -1);
-            const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0);
+            const int ns = slots_of(l);
             if (ns == 0) continue;
             const size_t part = cp_lay[(size_t) l.il][3], bytes = (size_t) ns * part;
             std::array<uint8_t*, 2> base = {nullptr, nullptr};
@@ -5047,7 +5066,7 @@ struct Model::Impl {
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
                 size_t got = bytes;
-                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH));
+                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH, arena_thp));
                 if (huge && base[(size_t) X] == nullptr) {   // no pool on this machine: the ordinary arena instead
                     static bool warned = false;
                     if (!warned) {
@@ -5057,7 +5076,7 @@ struct Model::Impl {
                     }
                     arena_all_huge = false;
                     got = bytes;
-                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
                 }
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
