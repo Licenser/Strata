@@ -220,8 +220,8 @@ std::vector<std::vector<os::Core>> node_threads() {
     }
     return nodes;
 }
-// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages when `thp` asks
+void* node_map(size_t bytes, int node, int n_nodes, bool thp = true) { return os::anon_alloc(bytes, node, n_nodes, thp); }
 void pin_self(int cpu) { os::pin_self(cpu); }
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
@@ -5914,6 +5914,12 @@ struct Model::Impl {
             used += add;
             ++n_copy[(size_t) l.il];
         }
+        // transparent huge pages only on request: their compaction slowed the copy (#2126)
+        const bool arena_thp = strata::ds4::arena_thp_default(std::getenv("STRATA_ARENA_THP") != nullptr,
+                                                              std::getenv("STRATA_NO_ARENA_THP") != nullptr, defaults_026());
+        if (o.verbose && !huge_arena)
+            std::fprintf(stderr, "ds4: copy arena: transparent huge pages %s\n",
+                         arena_thp ? "requested" : "not requested (STRATA_ARENA_THP=1 requests them)");
         // each layer's slots: one block per node of (copies + spare) parts
         std::vector<int> first(L.size(), -1);
         copy_spare.assign(L.size(), -1);
@@ -5930,7 +5936,7 @@ struct Model::Impl {
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
                 size_t got = bytes;
-                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH));
+                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH, arena_thp));
                 if (huge && base[(size_t) X] == nullptr) {   // no pool on this machine: the ordinary arena instead
                     static bool warned = false;
                     if (!warned) {
@@ -5940,7 +5946,7 @@ struct Model::Impl {
                     }
                     arena_all_huge = false;
                     got = bytes;
-                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
                 }
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {

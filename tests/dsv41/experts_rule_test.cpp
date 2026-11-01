@@ -292,6 +292,13 @@ int main() {
         CHECK_EQ(copy_hugetlb_default(-1, 90 * GB, 100 * GB, false), 0);
         CHECK_EQ(copy_hugetlb_default(1, 0.0, 100 * GB, true), 1);
         CHECK_EQ(copy_hugetlb_default(0, 120 * GB, 100 * GB, false), 0);              // the old DS4_COPY_HUGETLB=0
+        // the copy arena's THP request: only when STRATA_ARENA_THP or 0.2.6 asks; STRATA_NO_ARENA_THP wins over both
+        CHECK_EQ(arena_thp_default(false, false), 0);
+        CHECK_EQ(arena_thp_default(true, false), 1);                                  // STRATA_ARENA_THP=1
+        CHECK_EQ(arena_thp_default(false, true), 0);                                  // STRATA_NO_ARENA_THP=1
+        CHECK_EQ(arena_thp_default(true, true), 0);                                   // both: the skip wins, as in the core engine
+        CHECK_EQ(arena_thp_default(false, false, true), 1);                           // DS4_DEFAULTS=026
+        CHECK_EQ(arena_thp_default(false, true, true), 0);
         // the matrix-core attention: opt-in again, except on gfx12 and (since 2026-10-28) on gfx1151 on Windows
         CHECK_EQ(fast_attn_default(-1, true, false, true), 0);
         CHECK_EQ(fast_attn_default(-1, true, false, false), 1);
